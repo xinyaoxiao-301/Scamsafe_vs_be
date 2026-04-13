@@ -16,11 +16,10 @@ import random
 import asyncio
 import re as _re
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from groq import Groq
 from dotenv import load_dotenv
 from upstash_vector import Index
-from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -46,7 +45,7 @@ EMBED_MODEL = "all-MiniLM-L6-v2"
 # ── Lazy singletons ───────────────────────────────────────────────────────────
 _groq_client:    Optional[Groq]                = None
 _upstash_index:  Optional[Index]              = None
-_embed_model:    Optional[SentenceTransformer] = None
+_embed_model:    Optional[Any] = None
 
 
 def _get_groq() -> Groq:
@@ -66,9 +65,21 @@ def _get_index() -> Index:
     return _upstash_index
 
 
-def _get_embed_model() -> SentenceTransformer:
+def _get_embed_model() -> Any:
     global _embed_model
     if _embed_model is None:
+        # `sentence-transformers` (and its Torch stack) is very heavy and can
+        # exceed free-tier build/runtime limits on some platforms. We treat RAG
+        # seeds as an optional enhancement; if embeddings aren't available,
+        # the simulator still works without them.
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "Embeddings backend not available. Install `sentence-transformers` "
+                "to enable RAG seeds."
+            ) from exc
+
         _embed_model = SentenceTransformer(EMBED_MODEL)
     return _embed_model
 
@@ -132,8 +143,8 @@ setting, backstory, and relationship dynamic. All phrasing must be your own.
 def _fetch_rag_seeds_sync(category: str, top_k: int = 15) -> list[str]:
     ns = category.strip().lower().replace(" ", "_").replace("/", "_")
     query_text = f"Realistic dialogue phrases used in a {category}"
-    query_vec = _get_embed_model().encode(query_text).tolist()
     try:
+        query_vec = _get_embed_model().encode(query_text).tolist()
         results = _get_index().query(
             vector=query_vec, top_k=top_k, include_metadata=True, namespace=ns,
         )
