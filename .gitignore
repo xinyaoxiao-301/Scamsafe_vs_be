@@ -1,0 +1,4 @@
+.env
+/draft
+/venv
+ingest_rag.py
