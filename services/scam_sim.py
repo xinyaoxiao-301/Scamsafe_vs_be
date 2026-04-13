@@ -21,6 +21,7 @@ from groq import Groq
 from dotenv import load_dotenv
 from upstash_vector import Index
 
+
 load_dotenv()
 
 # ── Slug → human-readable category ───────────────────────────────────────────
@@ -40,7 +41,7 @@ GOODBYE_PHRASES = [
     "quit", "exit", "stop", "cya", "take care", "gotta go",
 ]
 
-EMBED_MODEL = "all-MiniLM-L6-v2"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # ── Lazy singletons ───────────────────────────────────────────────────────────
 _groq_client:    Optional[Groq]                = None
@@ -68,19 +69,15 @@ def _get_index() -> Index:
 def _get_embed_model() -> Any:
     global _embed_model
     if _embed_model is None:
-        # `sentence-transformers` (and its Torch stack) is very heavy and can
-        # exceed free-tier build/runtime limits on some platforms. We treat RAG
-        # seeds as an optional enhancement; if embeddings aren't available,
-        # the simulator still works without them.
         try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
+            from fastembed import TextEmbedding  # type: ignore
         except Exception as exc:
             raise RuntimeError(
-                "Embeddings backend not available. Install `sentence-transformers` "
+                "Embeddings backend not available. Install `fastembed` "
                 "to enable RAG seeds."
             ) from exc
 
-        _embed_model = SentenceTransformer(EMBED_MODEL)
+        _embed_model = TextEmbedding(EMBED_MODEL)
     return _embed_model
 
 
@@ -141,10 +138,11 @@ setting, backstory, and relationship dynamic. All phrasing must be your own.
 
 
 def _fetch_rag_seeds_sync(category: str, top_k: int = 15) -> list[str]:
-    ns = category.strip().lower().replace(" ", "_").replace("/", "_")
+    ns = category.strip().lower().replace(" ", "").replace("/", "")
     query_text = f"Realistic dialogue phrases used in a {category}"
     try:
-        query_vec = _get_embed_model().encode(query_text).tolist()
+        embeddings = list(_get_embed_model().embed([query_text]))
+        query_vec = embeddings[0].tolist()
         results = _get_index().query(
             vector=query_vec, top_k=top_k, include_metadata=True, namespace=ns,
         )
