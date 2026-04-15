@@ -309,7 +309,7 @@ async def create_session(scenario_slug: str) -> dict:
 
     normal_prompt = _normal_prompt(category, seeds)
     scam_prompt   = _scam_prompt(category, seeds)
-    scam_turn     = random.randint(3, 10)
+    scam_turn     = random.randint(3, 5)
 
     opening = await asyncio.to_thread(_get_opening_sync, normal_prompt)
 
