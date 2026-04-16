@@ -27,8 +27,16 @@ Analyze the given message and return a JSON response with this exact structure:
   "action_steps": ["<step 1>", "<step 2>", "<step 3>"]
 }
 
-Scam types include: Phishing, Impersonation, Investment Scam, Lottery/Prize Scam,
-Romance Scam, Tech Support Scam, Bank Fraud, Job Scam, Not a scam.
+scam_type MUST be exactly one of these values — no variations, no combining:
+- "Phishing"
+- "Impersonation"
+- "Investment Scam"
+- "Lottery/Prize Scam"
+- "Romance Scam"
+- "Tech Support Scam"
+- "Bank Fraud"
+- "Other"
+- "Not a scam"
 
 Warning indicators should be specific to the message (e.g. "Asks for bank details",
 "Creates false urgency", "Unknown sender").
@@ -49,6 +57,12 @@ def _get_client() -> Groq:
     return _client
 
 
+VALID_SCAM_TYPES = {
+    "Phishing", "Impersonation", "Investment Scam",
+    "Lottery/Prize Scam", "Romance Scam", "Tech Support Scam",
+    "Bank Fraud", "Other", "Not a scam"
+}
+
 def _analyze_sync(message: str) -> dict:
     client = _get_client()
     completion = client.chat.completions.create(
@@ -59,17 +73,19 @@ def _analyze_sync(message: str) -> dict:
         ],
         temperature=0.2,
         max_tokens=600,
+        response_format={"type": "json_object"},
     )
     raw = completion.choices[0].message.content.strip()
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON from model: {e}\nRaw: {raw!r}")
 
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
+    # Sanitise scam_type if model drifts outside allowed values
+    if result.get("scam_type") not in VALID_SCAM_TYPES:
+        result["scam_type"] = "Other"
 
-    return json.loads(raw)
+    return result
 
 
 async def analyze_message(message: str) -> dict:
