@@ -13,10 +13,8 @@ Required environment variables (put in a .env file):
     GROQ_API_KEY
     UPSTASH_VECTOR_REST_URL
     UPSTASH_VECTOR_REST_TOKEN
-    DATABASE_URL  (optional — falls back to the hardcoded Neon URL in quiz_service.py)
+    DATABASE_URL  (Neon psql connection string)
 """
-# run command
-# uvicorn main:app --reload --port 8000
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +23,7 @@ from pydantic import BaseModel
 from services.scam_detector import analyze_message
 from services.scam_sim import create_session, send_message, quit_session
 from services.quiz_service import get_quizzes, get_questions
+from services.notification_service import get_random_notification, get_notification_by_id
 
 app = FastAPI(title="ScamSafe API")
 
@@ -160,5 +159,46 @@ async def quiz_questions(quiz_slug: str, count: int = 6):
         return await get_questions(quiz_slug, count)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. Notification Challenge
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/notifications/random")
+async def notification_random():
+    """
+    Fetch one random notification to display to the user.
+    The label (scam / not_scam) is intentionally withheld so the
+    user cannot inspect it before deciding to open or dismiss.
+
+    Response: { id: int, message: string }
+    """
+    try:
+        return await get_random_notification()
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/notifications/{notification_id}")
+async def notification_reveal(notification_id: int):
+    """
+    Reveal the verdict for a notification after the user clicks 'Open'.
+
+    Path param:  notification_id — the id returned by /api/notifications/random
+    Response:    { id: int, message: string, label: string, is_scam: bool }
+    """
+    try:
+        return await get_notification_by_id(notification_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
