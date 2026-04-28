@@ -61,17 +61,31 @@ def _fetch_notification_by_id(notification_id: int) -> dict:
                 (notification_id,),
             )
             row = cur.fetchone()
+
+            if row is None:
+                raise ValueError(f"Notification with id={notification_id} not found.")
+
+            cur.execute(
+                """
+                SELECT explanation_number, explanation_text
+                FROM explanation
+                WHERE notification_id = %s
+                ORDER BY explanation_number ASC
+                """,
+                (notification_id,),
+            )
+            explanation_rows = cur.fetchall()
     finally:
         conn.close()
 
-    if row is None:
-        raise ValueError(f"Notification with id={notification_id} not found.")
+    explanations = [r["explanation_text"] for r in explanation_rows]
 
     return {
-        "id":      row["id"],
-        "message": row["message"],
-        "label":   row["label"],
-        "is_scam": row["label"] == "scam",
+        "id":           row["id"],
+        "message":      row["message"],
+        "label":        row["label"],
+        "is_scam":      row["label"] == "scam",
+        "explanations": explanations,
     }
 
 

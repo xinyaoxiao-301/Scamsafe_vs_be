@@ -192,7 +192,8 @@ async def notification_reveal(notification_id: int):
     Reveal the verdict for a notification after the user clicks 'Open'.
 
     Path param:  notification_id — the id returned by /api/notifications/random
-    Response:    { id: int, message: string, label: string, is_scam: bool }
+    Response:    { id: int, message: string, label: string, is_scam: bool,
+                   explanations: list[str] }
     """
     try:
         return await get_notification_by_id(notification_id)

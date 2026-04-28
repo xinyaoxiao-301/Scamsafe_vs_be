@@ -20,7 +20,6 @@ Analyze the given message and return a JSON response with this exact structure:
 {
   "is_scam": true or false,
   "risk_level": "Very Low" | "Low" | "Medium" | "High" | "Very High",
-  "confidence_percentage": <number 0-100>,
   "scam_type": "<type or 'Not a scam'>",
   "summary": "<1-2 sentence plain English explanation of why this is or isn't a scam>",
   "warning_indicators": ["<indicator 1>", "<indicator 2>", "<indicator 3>"],

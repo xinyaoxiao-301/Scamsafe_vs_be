@@ -48,7 +48,6 @@ async def analyze(body: AnalyzeRequest) -> AnalyzeResponse:
     return AnalyzeResponse(
         is_scam=raw["is_scam"],
         risk_level=raw["risk_level"],
-        confidence_pct=raw["confidence_percentage"],
         scam_type=raw["scam_type"],
         summary=raw["summary"],
         indicators=[{"title": i, "description": ""} for i in raw["warning_indicators"]],
