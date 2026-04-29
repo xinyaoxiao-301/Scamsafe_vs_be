@@ -22,13 +22,13 @@ from pydantic import BaseModel
 
 from services.scam_detector import analyze_message
 from services.scam_sim import create_session, send_message, quit_session
-from services.quiz_service import get_quizzes, get_questions
-from services.notification_service import get_random_notification, get_notification_by_id
+from services.quiz_service import get_quizzes, get_questions # scam quiz database import
+from services.notification_service import get_random_notification, get_notification_by_id # scam notifications import
+from services.scam_news import init_db_pool, close_db_pool, get_news_list, get_article_with_tips # scam news database import
 
 app = FastAPI(title="ScamSafe API")
 
-# ── CORS ───────────────────────────────────────────────────────────────────────
-# Allow all origins for local development. Tighten in production.
+# CORS: Allow all origins for local development. Tighten in production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,9 +38,7 @@ app.add_middleware(
 )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. Scam Detection
-# ──────────────────────────────────────────────────────────────────────────────
+# Epic 1: Scam Detection
 
 class DetectRequest(BaseModel):
     text:     str
@@ -66,9 +64,7 @@ async def detect(req: DetectRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. Scam Simulation
-# ──────────────────────────────────────────────────────────────────────────────
+# Epic 3: Scam Simulation
 
 class StartRequest(BaseModel):
     scenario_type: str  # e.g. "romance-scams"
@@ -129,9 +125,7 @@ async def simulate_quit(req: QuitRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. Study Center Quiz
-# ──────────────────────────────────────────────────────────────────────────────
+# Epic 2: Study Center Quiz
 
 @app.get("/api/quiz/topics")
 async def quiz_topics():
@@ -163,9 +157,8 @@ async def quiz_questions(quiz_slug: str, count: int = 6):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. Notification Challenge
-# ──────────────────────────────────────────────────────────────────────────────
+
+# Epic 4: Notification Challenge
 
 @app.get("/api/notifications/random")
 async def notification_random():
@@ -201,5 +194,40 @@ async def notification_reveal(notification_id: int):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except EnvironmentError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+# Epic 5: Scam News & Tips
+
+@app.get("/api/scam/news")
+async def scam_news_list(limit: int = 10):
+    """
+    Return a paginated list of scam news articles (rank, title, date, source, url).
+
+    Query parameter: limit (default 10)
+    Response: list of objects with article_id, rank, title, published, source, url
+    """
+    try:
+        articles = await get_news_list(limit)
+        return articles
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/scam/news/{article_id}")
+async def scam_news_detail(article_id: int):
+    """
+    Return a single scam article with its full content and prevention tips.
+
+    Path parameter: article_id
+    Response: { article_id, rank, title, published, source, url, article_content, tips: [...] }
+    """
+    try:
+        article = await get_article_with_tips(article_id)
+        if article is None:
+            raise HTTPException(status_code=404, detail="Article not found")
+        return article
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
