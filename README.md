@@ -310,6 +310,8 @@ Response:
 | `services/scam_detector.py` | Groq LLaMA scam analysis |
 | `services/scam_sim.py` | RAG + Groq simulation sessions |
 | `services/quiz_service.py` | Neon PostgreSQL quiz retrieval |
+| `scam_news.py` | Neon PostgreSQL news retrieval |
+| `notification_service.py` | Neon PostgreSQL notification retrieval |
 
 ---
 
