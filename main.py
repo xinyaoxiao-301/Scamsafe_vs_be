@@ -58,7 +58,7 @@ async def detect(req: DetectRequest):
         raise HTTPException(status_code=400, detail="text must not be empty")
 
     try:
-        result = await analyze_message(req.text)
+        result = await analyze_message(req.text, req.language)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
