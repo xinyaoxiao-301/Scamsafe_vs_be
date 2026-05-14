@@ -58,15 +58,12 @@ async def detect(req: DetectRequest):
 
 class StartRequest(BaseModel):
     scenario_type: str
-    language:      SimLanguage = "en"   # NEW — forwarded to scam_sim.create_session
+    language:      SimLanguage = "en"
 
 
 class MessageRequest(BaseModel):
     session_id: str
     message:    str
-    # language is stored on the session server-side after create_session;
-    # no need to send it again on each message — kept here for completeness /
-    # future stateless deployments.
 
 
 class QuitRequest(BaseModel):
@@ -104,17 +101,30 @@ async def simulate_quit(req: QuitRequest):
 # ── Epic 2: Study Center Quiz ────────────────────────────────────────────────
 
 @app.get("/api/quiz/topics")
-async def quiz_topics():
+async def quiz_topics(language: str = "en"):
+    """
+    Query param:  language — 'en' (default) | 'ms' | 'zh'
+    Returns the list of published quiz topics with translated titles/descriptions.
+    """
     try:
-        return await get_quizzes()
+        return await get_quizzes(language)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/quiz/{quiz_slug}/questions")
-async def quiz_questions(quiz_slug: str, count: int = 6):
+async def quiz_questions(quiz_slug: str, count: int = 6, language: str = "en"):
+    """
+    Path param:   quiz_slug — a quiz slug or "mixed"
+    Query params:
+        count    — number of questions to return (default 6)
+        language — 'en' (default) | 'ms' | 'zh'
+
+    Questions and choices are returned in the requested language where
+    translations exist, falling back to English for untranslated rows.
+    """
     try:
-        return await get_questions(quiz_slug, count)
+        return await get_questions(quiz_slug, count, language)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
