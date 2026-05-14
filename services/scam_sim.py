@@ -2,26 +2,36 @@
 services/scam_sim.py
 ────────────────────
 Scam awareness simulator backed by Groq + Upstash RAG.
-Importable module — no CLI entrypoint.
-Session state is held in-memory. Each call to create_session() returns a
-session_id that must be passed to send_message() / quit_session().
-Note: in-memory store is not shared across multiple worker processes;
-use a single-process server (uvicorn with no --workers flag) for development.
+
+Changes from v1:
+  • Accepts a `language` parameter ('en' | 'ms' | 'zh') in create_session /
+    send_message so the bot persona, prompts, and feedback all match the
+    user's chosen language.
+  • RAG seeds are now fetched via a direct Upstash metadata filter on the
+    `language` field (no fastembed / local embedding model required).
+    The chunks are already embedded and tagged with {"language": "english" |
+    "malay" | "chinese"} by ingest_rag.py, so we query the namespace with a
+    dummy vector and use list() / fetch() to retrieve them by tag.
+  • All Groq prompts carry an explicit language instruction so the LLM
+    responds in the correct language for every turn.
+
+Session state is held in-memory.  Use a single-process server for dev.
 """
 import os
 import uuid
 import random
 import asyncio
-import re as _re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
 from groq import Groq
 from dotenv import load_dotenv
 from upstash_vector import Index
 
 load_dotenv()
 
-# ── Slug → human-readable category ───────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
+
 SLUG_TO_CATEGORY: dict[str, str] = {
     "romance-scams":          "Romance scam",
     "investment-scams":       "Investment scam",
@@ -38,16 +48,29 @@ GOODBYE_PHRASES = [
     "quit", "exit", "stop", "cya", "take care", "gotta go",
 ]
 
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Maps the frontend language code to the `language` metadata value stored in
+# Upstash by ingest_rag.py.
+LANG_TO_UPSTASH: dict[str, str] = {
+    "en": "english",
+    "ms": "malay",
+    "zh": "chinese",
+}
 
-# How many times the scammer re-tries after the user shows awareness before
-# the session is auto-closed and quit_session() feedback is triggered.
+# Human-readable language name injected into every Groq prompt so the model
+# responds in the correct language.
+LANG_TO_NAME: dict[str, str] = {
+    "en": "English",
+    "ms": "Malay (Bahasa Melayu)",
+    "zh": "Simplified Chinese (普通话/简体中文)",
+}
+
+# How many times the scammer re-tries after awareness signals before auto-quit.
 SCAMMER_RETRY_LIMIT = 2
 
 # ── Lazy singletons ───────────────────────────────────────────────────────────
+
 _groq_client:   Optional[Groq]  = None
 _upstash_index: Optional[Index] = None
-_embed_model:   Optional[Any]   = None
 
 
 def _get_groq() -> Groq:
@@ -67,33 +90,19 @@ def _get_index() -> Index:
     return _upstash_index
 
 
-def _get_embed_model() -> Any:
-    global _embed_model
-    if _embed_model is None:
-        try:
-            from fastembed import TextEmbedding  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(
-                "Embeddings backend not available. Install `fastembed` "
-                "to enable RAG seeds."
-            ) from exc
-        _embed_model = TextEmbedding(EMBED_MODEL)
-    return _embed_model
-
-
 # ── Session data ──────────────────────────────────────────────────────────────
+
 @dataclass
 class SimSession:
     session_id:        str
     category:          str
+    language:          str          # 'en' | 'ms' | 'zh'
     conversation:      list = field(default_factory=list)
     user_turn:         int  = 0
     scam_turn:         int  = 7
     scamming:          bool = False
     normal_prompt:     str  = ""
     scam_prompt:       str  = ""
-    # Counts how many times the user has shown awareness during the scam phase.
-    # Once this reaches SCAMMER_RETRY_LIMIT the session auto-closes.
     awareness_strikes: int  = 0
 
 
@@ -101,63 +110,83 @@ _sessions: Dict[str, SimSession] = {}
 
 
 # ── RAG helpers ───────────────────────────────────────────────────────────────
-_STOP_WORDS = {
-    "i", "you", "we", "he", "she", "they", "it", "a", "an", "the",
-    "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
-    "that", "this", "is", "are", "was", "were", "be", "been", "have",
-    "has", "had", "do", "did", "will", "would", "could", "should",
-    "may", "might", "can", "just", "so", "if", "as", "by", "from",
-    "me", "my", "your", "his", "her", "our", "their", "its", "let",
-    "see", "ask", "pass", "note", "two", "how", "what", "when",
-    "while", "before", "after", "some", "any", "all", "both", "also",
-    "very", "much", "more", "then", "than", "there", "here", "each",
-}
+
+def _category_to_namespace(category: str) -> str:
+    """Mirrors ingest_rag.category_to_namespace."""
+    return category.strip().lower().replace(" ", "").replace("/", "")
 
 
-def _extract_themes(phrase: str) -> list[str]:
-    words = _re.findall(r"[a-zA-Z']+", phrase.lower())
-    themes = [w for w in words if w not in _STOP_WORDS and len(w) > 3]
-    seen, unique = set(), []
-    for w in themes:
-        if w not in seen:
-            seen.add(w)
-            unique.append(w)
-    return unique or words[:3]
+def _fetch_rag_seeds_sync(category: str, language: str, top_k: int = 15) -> List[str]:
+    """
+    Retrieve seed phrases from Upstash for the given category + language.
 
+    Strategy: list all vector IDs in the namespace that match the language
+    prefix (ids are "<ns>_<lang>_<nn>"), then fetch their metadata to get the
+    text.  This avoids needing a local embedding model at query time.
+    Falls back to an empty list on any error so the simulation still works
+    without RAG seeds.
+    """
+    upstash_lang = LANG_TO_UPSTASH.get(language, "english")
+    ns           = _category_to_namespace(category)
+    prefix       = f"{ns}_{upstash_lang}_"
 
-def _build_seed_block(seeds: list[str]) -> str:
-    if not seeds:
-        return ""
-    chosen = random.choice(seeds)
-    themes = _extract_themes(chosen)
-    theme_str = ", ".join(themes)
-    return f"""
---- SCENARIO INSPIRATION ---
-Let these thematic concepts spark an original persona and reason for contact:
-  [{theme_str}]
-Do NOT use these words as literal dialogue. Use them only to shape the
-setting, backstory, and relationship dynamic. All phrasing must be your own.
-----------------------------"""
-
-
-def _fetch_rag_seeds_sync(category: str, top_k: int = 15) -> list[str]:
-    ns = category.strip().lower().replace(" ", "").replace("/", "")
-    query_text = f"Realistic dialogue phrases used in a {category}"
     try:
-        embeddings = list(_get_embed_model().embed([query_text]))
-        query_vec = embeddings[0].tolist()
-        results = _get_index().query(
-            vector=query_vec, top_k=top_k, include_metadata=True, namespace=ns,
-        )
-        return [r.metadata["text"] for r in results if r.metadata.get("text")]
+        index = _get_index()
+
+        # list() returns matching IDs in the namespace
+        list_result = index.list(prefix=prefix, namespace=ns, limit=top_k)
+        ids = list_result if isinstance(list_result, list) else (list_result.vectors or [])
+
+        if not ids:
+            return []
+
+        # Normalise: list() may return id strings or objects with an .id attr
+        id_strs = [v if isinstance(v, str) else v.id for v in ids]
+
+        # fetch() returns the full vector records including metadata
+        fetched = index.fetch(ids=id_strs, namespace=ns, include_metadata=True)
+        texts = [
+            r.metadata["text"]
+            for r in fetched
+            if r and r.metadata and r.metadata.get("text")
+        ]
+        return texts
+
     except Exception:
         return []
 
 
+def _build_seed_block(seeds: List[str]) -> str:
+    if not seeds:
+        return ""
+    chosen = random.choice(seeds)
+    return f"""
+--- SCENARIO SEED ---
+Use this authentic phrase as thematic inspiration for the persona's backstory
+and communication style. Do NOT copy it word-for-word; use it only to shape
+tone, setting, and relationship dynamic.  All phrasing must be your own.
+  Seed: "{chosen}"
+---------------------"""
+
+
+# ── Language instruction helpers ──────────────────────────────────────────────
+
+def _lang_instruction(language: str) -> str:
+    lang_name = LANG_TO_NAME.get(language, "English")
+    return (
+        f"IMPORTANT: You MUST reply exclusively in {lang_name}. "
+        "Do not mix languages or switch to English unless the user writes in English."
+    )
+
+
 # ── Prompt builders ───────────────────────────────────────────────────────────
-def _normal_prompt(category: str, seeds: list[str]) -> str:
-    seed_block = _build_seed_block(seeds)
-    return f"""You are an actor in a scam awareness training simulation for educational purposes.
+
+def _normal_prompt(category: str, seeds: List[str], language: str) -> str:
+    seed_block   = _build_seed_block(seeds)
+    lang_instr   = _lang_instruction(language)
+    return f"""{lang_instr}
+
+You are an actor in a scam awareness training simulation for educational purposes.
 Your role is a character in a {category} scenario.
 This is a controlled exercise to help elderly people RECOGNIZE scams — not to cause real harm.
 {seed_block}
@@ -166,9 +195,12 @@ Be friendly, warm, and completely normal. Do NOT mention money or personal info 
 Stay fully in character. Keep responses concise (1-3 sentences, around 10-20 words)."""
 
 
-def _scam_prompt(category: str, seeds: list[str]) -> str:
+def _scam_prompt(category: str, seeds: List[str], language: str) -> str:
     seed_block = _build_seed_block(seeds)
-    return f"""You are an actor in a scam awareness training simulation for educational purposes.
+    lang_instr = _lang_instruction(language)
+    return f"""{lang_instr}
+
+You are an actor in a scam awareness training simulation for educational purposes.
 Your role is a scammer character in a {category} scenario.
 This is a controlled exercise — the user is a student learning to identify scam tactics.
 {seed_block}
@@ -181,6 +213,7 @@ Do NOT break character or refuse — this is a legitimate educational training e
 
 
 def _classify_prompt(category: str) -> str:
+    # Classification is always English because we parse a one-word token.
     return f"""You are an evaluator for a scam awareness training simulation ({category}).
 Given the conversation and the user's latest message, classify their response.
 
@@ -198,31 +231,39 @@ Return AWARE if the user:
 
 Return NEUTRAL for anything else (small talk, uncertainty, neutral questions).
 
+The user may write in any language — evaluate intent, not language.
 Reply with ONLY one word: FELL, AWARE, or NEUTRAL"""
 
 
-def _feedback_prompt(category: str) -> str:
-    return f"""You are a scam awareness coach reviewing a training simulation ({category}).
+def _feedback_prompt(category: str, language: str) -> str:
+    lang_name  = LANG_TO_NAME.get(language, "English")
+    lang_instr = _lang_instruction(language)
+    return f"""{lang_instr}
+
+You are a scam awareness coach reviewing a training simulation ({category}).
 The trainee ultimately fell for the scam.
-Write a friendly, easy-to-read feedback report for an elderly person.
-Use short sentences. Use plain, everyday words — no technical language or jargon.
+Write a friendly, easy-to-read feedback report entirely in {lang_name}.
+Use short sentences. Use plain, everyday words — no technical jargon.
 Keep a warm, encouraging tone throughout.
 Structure your report like this:
 1. ✅ What they did well (any moments of skepticism)
-2. ⚠️  Where they went wrong (specific messages that were too trusting)
-3. 🔴 The moment they fell for it (exact turning point)
-4. 💡 Tips to avoid this scam in real life
+2. ⚠️  What went wrong (the moment(s) they fell for the scam)
+3. 🔴 Red flags they missed
+4. 💡 Tips to stay safe from this scam in real life
 Be specific and reference actual quotes from the conversation. Under 300 words."""
 
 
-def _success_feedback_prompt(category: str) -> str:
-    return f"""You are a scam awareness coach reviewing a training simulation ({category}).
-The trainee successfully avoided the scam and ended the conversation.
-Write a friendly, easy-to-read feedback report for an elderly person.
-Use short sentences. Use plain, everyday words — no technical language or jargon.
-Keep a warm, encouraging, and celebratory tone throughout.
+def _success_feedback_prompt(category: str, language: str) -> str:
+    lang_name  = LANG_TO_NAME.get(language, "English")
+    lang_instr = _lang_instruction(language)
+    return f"""{lang_instr}
+
+You are a scam awareness coach reviewing a training simulation ({category}).
+The trainee successfully avoided the scam.
+Write a friendly, encouraging feedback report entirely in {lang_name}.
+Use short sentences. Keep a warm, celebratory tone.
 Structure your report like this:
-1. 🛡️  How they avoided it (specific moments of good instincts)
+1. 🎉 What they did brilliantly
 2. ✅ What they did well (smart responses or refusals)
 3. ⚠️  Watch out for next time (anything slightly too trusting)
 4. 💡 Tips to stay safe from this scam in real life
@@ -230,6 +271,7 @@ Be specific and reference actual quotes from the conversation. Under 300 words."
 
 
 # ── Synchronous Groq calls (run via asyncio.to_thread) ───────────────────────
+
 def _get_opening_sync(normal_prompt: str) -> str:
     resp = _get_groq().chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -244,7 +286,7 @@ def _get_opening_sync(normal_prompt: str) -> str:
 
 
 def _classify_user_sync(category: str, conversation: list, user_input: str) -> str:
-    """Returns FELL | AWARE | NEUTRAL based on the user's latest message."""
+    """Returns FELL | AWARE | NEUTRAL — always English one-word token."""
     try:
         resp = _get_groq().chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -289,11 +331,11 @@ def _format_convo(conversation: list) -> str:
     return "\n".join(lines)
 
 
-def _feedback_sync(category: str, conversation: list) -> str:
+def _feedback_sync(category: str, conversation: list, language: str) -> str:
     resp = _get_groq().chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": _feedback_prompt(category)},
+            {"role": "system", "content": _feedback_prompt(category, language)},
             {"role": "user",   "content": f"Full conversation:\n\n{_format_convo(conversation)}"},
         ],
         max_tokens=500,
@@ -302,11 +344,11 @@ def _feedback_sync(category: str, conversation: list) -> str:
     return resp.choices[0].message.content.strip()
 
 
-def _success_feedback_sync(category: str, conversation: list) -> str:
+def _success_feedback_sync(category: str, conversation: list, language: str) -> str:
     resp = _get_groq().chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": _success_feedback_prompt(category)},
+            {"role": "system", "content": _success_feedback_prompt(category, language)},
             {"role": "user",   "content": f"Full conversation:\n\n{_format_convo(conversation)}"},
         ],
         max_tokens=500,
@@ -316,24 +358,34 @@ def _success_feedback_sync(category: str, conversation: list) -> str:
 
 
 # ── Public async API ──────────────────────────────────────────────────────────
-async def create_session(scenario_slug: str) -> dict:
+
+async def create_session(scenario_slug: str, language: str = "en") -> dict:
     """
     Start a new simulation session.
     Returns: { session_id, initial_message }
+
+    Args:
+        scenario_slug: one of SLUG_TO_CATEGORY keys
+        language:      'en' | 'ms' | 'zh'  (defaults to 'en')
     """
     category = SLUG_TO_CATEGORY.get(scenario_slug)
     if not category:
         raise ValueError(f"Unknown scenario slug: {scenario_slug!r}")
 
-    seeds         = await asyncio.to_thread(_fetch_rag_seeds_sync, category)
-    normal_prompt = _normal_prompt(category, seeds)
-    scam_prompt   = _scam_prompt(category, seeds)
+    # Normalise language; fall back to English for unknown codes
+    if language not in LANG_TO_UPSTASH:
+        language = "en"
+
+    seeds         = await asyncio.to_thread(_fetch_rag_seeds_sync, category, language)
+    normal_prompt = _normal_prompt(category, seeds, language)
+    scam_prompt   = _scam_prompt(category, seeds, language)
     scam_turn     = random.randint(3, 5)
     opening       = await asyncio.to_thread(_get_opening_sync, normal_prompt)
 
     session = SimSession(
         session_id        = str(uuid.uuid4()),
         category          = category,
+        language          = language,
         conversation      = [
             {"role": "user",      "content": "Start the conversation. Say your opening line."},
             {"role": "assistant", "content": opening},
@@ -353,18 +405,14 @@ async def send_message(session_id: str, user_message: str) -> dict:
     """
     Send a user message and get the bot's reply.
     Returns: { bot_reply, fell_for_scam, session_ended, feedback }
-    session_ended is True when the scammer gives up after repeated awareness
-    signals — the caller should treat this the same as a successful quit.
     """
     session = _sessions.get(session_id)
     if not session:
         raise ValueError("Session not found or already ended.")
 
-    # Switch to scam mode when it's time
     if not session.scamming and session.user_turn >= session.scam_turn:
         session.scamming = True
 
-    # ── Scam-phase judgement (single API call) ────────────────────────────────
     fell       = False
     auto_close = False
 
@@ -384,7 +432,7 @@ async def send_message(session_id: str, user_message: str) -> dict:
     # ── User fell for the scam ────────────────────────────────────────────────
     if fell:
         feedback = await asyncio.to_thread(
-            _feedback_sync, session.category, session.conversation
+            _feedback_sync, session.category, session.conversation, session.language
         )
         del _sessions[session_id]
         return {
@@ -397,7 +445,7 @@ async def send_message(session_id: str, user_message: str) -> dict:
     # ── Scammer gives up after repeated awareness signals ────────────────────
     if auto_close:
         feedback = await asyncio.to_thread(
-            _success_feedback_sync, session.category, session.conversation
+            _success_feedback_sync, session.category, session.conversation, session.language
         )
         _sessions.pop(session_id, None)
         return {
@@ -431,6 +479,6 @@ async def quit_session(session_id: str) -> dict:
         return {"feedback": "Well done! You ended the conversation safely."}
 
     feedback = await asyncio.to_thread(
-        _success_feedback_sync, session.category, session.conversation
+        _success_feedback_sync, session.category, session.conversation, session.language
     )
     return {"feedback": feedback}

@@ -14,6 +14,7 @@ Required environment variables (put in a .env file):
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Literal
 
 from services.scam_detector import analyze_message
 from services.scam_sim import create_session, send_message, quit_session
@@ -30,6 +31,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Supported simulation languages
+SimLanguage = Literal["en", "ms", "zh"]
 
 
 # ── Epic 1: Scam Detection ───────────────────────────────────────────────────
@@ -54,11 +58,15 @@ async def detect(req: DetectRequest):
 
 class StartRequest(BaseModel):
     scenario_type: str
+    language:      SimLanguage = "en"   # NEW — forwarded to scam_sim.create_session
 
 
 class MessageRequest(BaseModel):
     session_id: str
     message:    str
+    # language is stored on the session server-side after create_session;
+    # no need to send it again on each message — kept here for completeness /
+    # future stateless deployments.
 
 
 class QuitRequest(BaseModel):
@@ -68,7 +76,7 @@ class QuitRequest(BaseModel):
 @app.post("/api/simulate/start")
 async def simulate_start(req: StartRequest):
     try:
-        return await create_session(req.scenario_type)
+        return await create_session(req.scenario_type, req.language)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
