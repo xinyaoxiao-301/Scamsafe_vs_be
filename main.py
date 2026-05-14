@@ -164,17 +164,26 @@ async def notification_reveal(notification_id: int, language: str = "en"):
 # ── Epic 5: Scam News & Tips ─────────────────────────────────────────────────
 
 @app.get("/api/scam/news")
-async def scam_news_list(limit: int = 10):
+async def scam_news_list(limit: int = 10, language: str = "en"):
+    """
+    Query params:
+        limit    — max articles to return (default 10)
+        language — 'en' (default) | 'ms' | 'zh'
+    """
     try:
-        return await get_news_list(limit)
+        return await get_news_list(limit, language)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/scam/news/{article_id}")
-async def scam_news_detail(article_id: int):
+async def scam_news_detail(article_id: int, language: str = "en"):
+    """
+    Path param:   article_id
+    Query param:  language — 'en' (default) | 'ms' | 'zh'
+    """
     try:
-        article = await get_article_with_tips(article_id)
+        article = await get_article_with_tips(article_id, language)
         if article is None:
             raise HTTPException(status_code=404, detail="Article not found")
         return article
