@@ -18,7 +18,7 @@ Older adults in Malaysia aged 60 and above account for 83.7% of scam victims bec
 
 The goal of ScamSafe is to create a simplified and trustworthy tool that helps elderly users:
 
-- identify suspicious messages and scam patterns in 3 languages (English, Malay, Chinese),
+- identify suspicious messages, links, and scam patterns,
 - protect their financial independence,
 - make safer decisions without needing advanced technical knowledge,
 - and maintain dignity by avoiding shame, embarrassment, or dependence when facing suspicious situations.
